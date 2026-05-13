@@ -302,11 +302,41 @@ PUSE
 
   echo "[!] gentoo-kernel-bin still failed"
   echo "[*] Fallback to source-built sys-kernel/gentoo-kernel"
-  echo "[*] This can take longer, but should be more reliable"
 
   emerge_retry sys-kernel/gentoo-kernel
 
   echo "[+] source-built gentoo-kernel installed"
+}
+
+install_grub_safe() {
+  echo "[*] Installing GRUB"
+
+  mkdir -p /boot/EFI
+
+  if [[ -d /sys/firmware/efi/efivars ]]; then
+    echo "[*] UEFI runtime detected"
+    echo "[*] Installing normal EFI boot entry"
+
+    grub-install \
+      --target=x86_64-efi \
+      --efi-directory=/boot \
+      --bootloader-id=Gentoo
+  else
+    echo "[!] EFI runtime not available"
+    echo "[*] Installing removable fallback EFI bootloader"
+
+    grub-install \
+      --target=x86_64-efi \
+      --efi-directory=/boot \
+      --bootloader-id=Gentoo \
+      --removable \
+      --no-nvram
+  fi
+
+  grub-mkconfig -o /boot/grub/grub.cfg
+
+  echo "[*] GRUB files:"
+  find /boot -maxdepth 4 -type f | sort || true
 }
 
 echo "[*] Cleaning broken make.profile if needed"
@@ -400,9 +430,7 @@ sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers || true
 echo "[*] Checking /boot"
 ls -lah /boot || true
 
-echo "[*] Installing GRUB"
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Gentoo
-grub-mkconfig -o /boot/grub/grub.cfg
+install_grub_safe
 
 echo "[*] Final env update"
 env-update
