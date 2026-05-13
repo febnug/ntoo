@@ -46,9 +46,10 @@ menu() {
 
 pick_disk() {
   local opts=()
+
   while read -r name size model; do
-    opts+=("/dev/$name" "$size $model")
-  done < <(lsblk -dpno NAME,SIZE,MODEL | awk '$1 !~ /loop|sr/ {print $1,$2,substr($0,index($0,$3))}' | sed 's#/dev/##')
+    opts+=("$name" "$size $model")
+  done < <(lsblk -dpno NAME,SIZE,MODEL | awk '$1 !~ /loop|sr/ {print $1,$2,substr($0,index($0,$3))}')
 
   DISK=$(dialog --backtitle "Gentoo TUI Installer" \
     --title "Disk Target" \
@@ -131,12 +132,16 @@ mount_target() {
   mount "$EFI" "$TARGET/boot"
 
   mkdir -p "$TARGET"/{proc,sys,dev,run}
-  mount --types proc /proc "$TARGET/proc"
-  mount --rbind /sys "$TARGET/sys"
-  mount --make-rslave "$TARGET/sys"
-  mount --rbind /dev "$TARGET/dev"
-  mount --make-rslave "$TARGET/dev"
-  mount --bind /run "$TARGET/run"
+
+  mountpoint -q "$TARGET/proc" || mount -t proc /proc "$TARGET/proc"
+
+  mountpoint -q "$TARGET/sys" || mount --rbind /sys "$TARGET/sys"
+  mount --make-rslave "$TARGET/sys" || true
+
+  mountpoint -q "$TARGET/dev" || mount --rbind /dev "$TARGET/dev"
+  mount --make-rslave "$TARGET/dev" || true
+
+  mountpoint -q "$TARGET/run" || mount --bind /run "$TARGET/run"
 }
 
 download_stage3() {
@@ -151,11 +156,11 @@ download_stage3() {
 
   STAGE3_FILE=$(awk '/stage3-amd64.*\.tar\.xz/ && !/CONTENTS|DIGESTS|asc|sha/ {print $1; exit}' latest-stage3.txt)
 
-  if [[ -z "$STAGE3_FILE" ]]; then
+  if [[ -z "${STAGE3_FILE:-}" ]]; then
     STAGE3_FILE=$(grep -o "stage3-amd64-${INIT}-[0-9T]*Z.tar.xz" latest-stage3.txt | head -n1)
   fi
 
-  [[ -n "$STAGE3_FILE" ]] || {
+  [[ -n "${STAGE3_FILE:-}" ]] || {
     msg "Error" "Gagal parse stage3 filename."
     exit 1
   }
@@ -168,6 +173,7 @@ download_stage3() {
 
 write_fstab() {
   local efi_uuid root_uuid
+
   efi_uuid=$(blkid -s UUID -o value "$EFI")
   root_uuid=$(blkid -s UUID -o value "$ROOT")
 
@@ -179,11 +185,14 @@ EOF
 
 write_make_conf() {
   local useflags=""
+
   if [[ "$PROFILE" == "desktop" ]]; then
     useflags='X wayland pipewire pulseaudio dbus elogind networkmanager'
   else
     useflags='-X'
   fi
+
+  mkdir -p "$TARGET/etc/portage"
 
   cat > "$TARGET/etc/portage/make.conf" <<EOF
 COMMON_FLAGS="-O2 -pipe -march=native"
@@ -195,9 +204,25 @@ FFLAGS="\${COMMON_FLAGS}"
 MAKEOPTS="-j$(nproc)"
 ACCEPT_LICENSE="*"
 USE="$useflags"
+
 VIDEO_CARDS="intel amdgpu radeonsi nouveau"
 INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
+EOF
+}
+
+write_repos_conf() {
+  mkdir -p "$TARGET/etc/portage/repos.conf"
+
+  cat > "$TARGET/etc/portage/repos.conf/gentoo.conf" <<'EOF'
+[DEFAULT]
+main-repo = gentoo
+
+[gentoo]
+location = /var/db/repos/gentoo
+sync-type = webrsync
+sync-uri = https://distfiles.gentoo.org/snapshots
+auto-sync = yes
 EOF
 }
 
@@ -208,14 +233,37 @@ copy_resolv() {
 write_chroot_script() {
   cat > "$TARGET/root/install-chroot.sh" <<EOF
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Eeo pipefail
+
+export DEBUGINFOD_URLS="\${DEBUGINFOD_URLS:-}"
+
+echo "[*] Cleaning broken make.profile if needed"
+if [[ -e /etc/portage/make.profile && ! -L /etc/portage/make.profile ]]; then
+  rm -f /etc/portage/make.profile
+fi
+
+echo "[*] Preparing Portage repo"
+mkdir -p /var/db/repos
+
+echo "[*] Sync Portage"
+emerge-webrsync || emerge --sync
+
+echo "[*] Setting Gentoo profile"
+if [[ "$INIT" == "openrc" ]]; then
+  eselect profile set default/linux/amd64/23.0 || eselect profile set default/linux/amd64/17.1
+else
+  eselect profile set default/linux/amd64/23.0/systemd || eselect profile set default/linux/amd64/17.1/systemd
+fi
+
+env-update
+source /etc/profile
 
 echo "[*] Setting timezone"
 echo "$TIMEZONE" > /etc/timezone
 emerge --config sys-libs/timezone-data || true
 
 echo "[*] Locale"
-echo "$LOCALE" >> /etc/locale.gen
+grep -qxF "$LOCALE" /etc/locale.gen || echo "$LOCALE" >> /etc/locale.gen
 locale-gen
 eselect locale set en_US.utf8 || true
 env-update
@@ -229,9 +277,6 @@ cat > /etc/hosts <<HOSTS
 127.0.1.1 $HOSTNAME
 ::1       localhost
 HOSTS
-
-echo "[*] Sync Portage"
-emerge-webrsync || emerge --sync
 
 echo "[*] Installing base packages"
 emerge --noreplace sys-kernel/linux-firmware
@@ -304,6 +349,7 @@ main_menu() {
         download_stage3
         write_fstab
         write_make_conf
+        write_repos_conf
         copy_resolv
         write_chroot_script
         run_chroot
