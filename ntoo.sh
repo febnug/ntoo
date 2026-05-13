@@ -237,6 +237,31 @@ set -Eeo pipefail
 
 export DEBUGINFOD_URLS="\${DEBUGINFOD_URLS:-}"
 
+emerge_retry() {
+  local pkg="\$1"
+
+  echo "[*] Emerging \$pkg"
+  if emerge --noreplace "\$pkg"; then
+    return 0
+  fi
+
+  echo "[!] emerge failed for \$pkg"
+  echo "[*] Trying autounmask write for \$pkg"
+
+  emerge --noreplace --autounmask-write=y --autounmask-use=y "\$pkg" || true
+
+  if [[ -d /etc/portage/package.use ]]; then
+    true
+  fi
+
+  etc-update --automode -5 || true
+  env-update
+  source /etc/profile
+
+  echo "[*] Retrying \$pkg"
+  emerge --noreplace "\$pkg"
+}
+
 echo "[*] Cleaning broken make.profile if needed"
 if [[ -e /etc/portage/make.profile && ! -L /etc/portage/make.profile ]]; then
   rm -f /etc/portage/make.profile
@@ -244,6 +269,16 @@ fi
 
 echo "[*] Preparing Portage repo"
 mkdir -p /var/db/repos
+mkdir -p /etc/portage/package.use
+mkdir -p /etc/portage/package.accept_keywords
+mkdir -p /etc/portage/package.license
+
+echo "[*] Pre-seeding USE flags needed by binary kernel/installkernel"
+cat > /etc/portage/package.use/installkernel <<'PUSE'
+sys-kernel/installkernel dracut
+sys-kernel/gentoo-kernel-bin initramfs
+sys-kernel/gentoo-sources initramfs
+PUSE
 
 echo "[*] Sync Portage"
 emerge-webrsync || emerge --sync
@@ -278,23 +313,28 @@ cat > /etc/hosts <<HOSTS
 ::1       localhost
 HOSTS
 
+echo "[*] Updating @world metadata"
+emerge --oneshot app-portage/gentoolkit || true
+
 echo "[*] Installing base packages"
-emerge --noreplace sys-kernel/linux-firmware
-emerge --noreplace sys-kernel/installkernel
-emerge --noreplace sys-kernel/gentoo-kernel-bin
-emerge --noreplace sys-boot/grub
-emerge --noreplace net-misc/dhcpcd
-emerge --noreplace app-admin/sudo
-emerge --noreplace app-shells/bash-completion
-emerge --noreplace sys-process/htop
-emerge --noreplace app-editors/vim
+emerge_retry sys-kernel/linux-firmware
+emerge_retry sys-kernel/installkernel
+emerge_retry sys-kernel/gentoo-kernel-bin
+emerge_retry sys-boot/grub
+emerge_retry net-misc/dhcpcd
+emerge_retry app-admin/sudo
+emerge_retry app-shells/bash-completion
+emerge_retry sys-process/htop
+emerge_retry app-editors/vim
 
 if [[ "$INIT" == "openrc" ]]; then
-  emerge --noreplace net-misc/networkmanager || true
+  emerge_retry net-misc/networkmanager || true
+
   rc-update add dhcpcd default || true
   rc-update add NetworkManager default || true
 else
-  emerge --noreplace net-misc/networkmanager || true
+  emerge_retry net-misc/networkmanager || true
+
   systemctl enable NetworkManager || true
   systemctl enable systemd-networkd || true
   systemctl enable systemd-resolved || true
@@ -303,17 +343,28 @@ fi
 echo "[*] Passwords"
 echo "root:$ROOTPASS" | chpasswd
 
-useradd -m -G wheel,audio,video,usb,users -s /bin/bash "$USERNAME" || true
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  useradd -m -G wheel,audio,video,usb,users -s /bin/bash "$USERNAME"
+fi
+
 echo "$USERNAME:$USERPASS" | chpasswd
 
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
 sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers || true
 
+echo "[*] Checking kernel image"
+ls -lah /boot || true
+
 echo "[*] Installing GRUB"
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Gentoo
 grub-mkconfig -o /boot/grub/grub.cfg
 
-echo "[*] Done inside chroot"
+echo "[*] Final env update"
+env-update
+source /etc/profile
+
+echo "[+] Done inside chroot"
+echo "[+] Gentoo install should be bootable now"
 EOF
 
   chmod +x "$TARGET/root/install-chroot.sh"
