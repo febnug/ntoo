@@ -208,6 +208,7 @@ USE="$useflags"
 VIDEO_CARDS="intel amdgpu radeonsi nouveau"
 INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
+FEATURES="-test"
 EOF
 }
 
@@ -236,23 +237,22 @@ write_chroot_script() {
 set -Eeo pipefail
 
 export DEBUGINFOD_URLS="\${DEBUGINFOD_URLS:-}"
+export PORTAGE_TMPDIR=/var/tmp
+export FEATURES="-test"
 
 emerge_retry() {
   local pkg="\$1"
 
   echo "[*] Emerging \$pkg"
+
   if emerge --noreplace "\$pkg"; then
     return 0
   fi
 
   echo "[!] emerge failed for \$pkg"
-  echo "[*] Trying autounmask write for \$pkg"
+  echo "[*] Trying autounmask for \$pkg"
 
   emerge --noreplace --autounmask-write=y --autounmask-use=y "\$pkg" || true
-
-  if [[ -d /etc/portage/package.use ]]; then
-    true
-  fi
 
   etc-update --automode -5 || true
   env-update
@@ -262,21 +262,70 @@ emerge_retry() {
   emerge --noreplace "\$pkg"
 }
 
+install_kernel_safe() {
+  echo "[*] Installing kernel safely"
+
+  mkdir -p /etc/portage/package.use
+  mkdir -p /var/tmp/portage
+  mkdir -p /var/cache/distfiles
+
+  cat > /etc/portage/package.use/kernel <<'PUSE'
+sys-kernel/installkernel dracut
+sys-kernel/gentoo-kernel-bin initramfs
+sys-kernel/gentoo-kernel initramfs
+sys-kernel/gentoo-sources initramfs
+PUSE
+
+  emerge_retry sys-kernel/installkernel
+
+  echo "[*] Trying gentoo-kernel-bin first"
+
+  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
+    echo "[+] gentoo-kernel-bin installed"
+    return 0
+  fi
+
+  echo "[!] gentoo-kernel-bin failed"
+  echo "[*] Cleaning possible broken temp/cache files"
+
+  rm -rf /var/tmp/portage/sys-kernel/gentoo-kernel-bin-* || true
+  rm -f /var/cache/distfiles/*gentoo-kernel-bin* || true
+  rm -f /var/cache/distfiles/*kernel*x86* || true
+  rm -f /var/cache/distfiles/*linux*bin* || true
+
+  echo "[*] Retrying gentoo-kernel-bin after cleanup"
+
+  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
+    echo "[+] gentoo-kernel-bin installed after cleanup"
+    return 0
+  fi
+
+  echo "[!] gentoo-kernel-bin still failed"
+  echo "[*] Fallback to source-built sys-kernel/gentoo-kernel"
+  echo "[*] This can take longer, but should be more reliable"
+
+  emerge_retry sys-kernel/gentoo-kernel
+
+  echo "[+] source-built gentoo-kernel installed"
+}
+
 echo "[*] Cleaning broken make.profile if needed"
 if [[ -e /etc/portage/make.profile && ! -L /etc/portage/make.profile ]]; then
   rm -f /etc/portage/make.profile
 fi
 
-echo "[*] Preparing Portage repo"
+echo "[*] Preparing Portage dirs"
 mkdir -p /var/db/repos
 mkdir -p /etc/portage/package.use
 mkdir -p /etc/portage/package.accept_keywords
 mkdir -p /etc/portage/package.license
+mkdir -p /var/tmp/portage
 
-echo "[*] Pre-seeding USE flags needed by binary kernel/installkernel"
+echo "[*] Pre-seeding USE flags"
 cat > /etc/portage/package.use/installkernel <<'PUSE'
 sys-kernel/installkernel dracut
 sys-kernel/gentoo-kernel-bin initramfs
+sys-kernel/gentoo-kernel initramfs
 sys-kernel/gentoo-sources initramfs
 PUSE
 
@@ -313,13 +362,9 @@ cat > /etc/hosts <<HOSTS
 ::1       localhost
 HOSTS
 
-echo "[*] Updating @world metadata"
-emerge --oneshot app-portage/gentoolkit || true
-
 echo "[*] Installing base packages"
 emerge_retry sys-kernel/linux-firmware
-emerge_retry sys-kernel/installkernel
-emerge_retry sys-kernel/gentoo-kernel-bin
+install_kernel_safe
 emerge_retry sys-boot/grub
 emerge_retry net-misc/dhcpcd
 emerge_retry app-admin/sudo
@@ -352,7 +397,7 @@ echo "$USERNAME:$USERPASS" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
 sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers || true
 
-echo "[*] Checking kernel image"
+echo "[*] Checking /boot"
 ls -lah /boot || true
 
 echo "[*] Installing GRUB"
