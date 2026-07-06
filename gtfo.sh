@@ -4,13 +4,10 @@
 # 
 # USAGE:
 #   Phase 1 (from LiveISO):
-#     # Make sure you have a working internet connection and a target disk
-#     # You may want to edit the variables below (DISK, etc.)
 #     chmod +x gentoo-installer.sh
 #     ./gentoo-installer.sh phase1
 #
 #   Phase 2 (automatically runs in chroot — or manually):
-#     # After phase1 drops you into the chroot, run:
 #     ./gentoo-installer.sh phase2
 #
 # WARNING: This will COMPLETELY WIPE the target disk. All data will be lost.
@@ -20,7 +17,7 @@ set -euo pipefail
 
 # ============================= CONFIGURATION ==================================
 # --- EDIT THESE TO MATCH YOUR HARDWARE ---
-DISK="/dev/nvme0n1"           # Target disk (e.g., /dev/sda, /dev/nvme0n1)
+DISK="/dev/sda"               # Target disk (e.g., /dev/sda, /dev/nvme0n1)
 HOSTNAME="gentoo-box"
 ROOT_PASSWORD="gentoo"
 USERNAME="user"
@@ -32,41 +29,42 @@ DESKTOP="plasma"
 # Init system: "openrc" or "systemd"
 INIT_SYSTEM="openrc"
 
-# --- EFI vs BIOS ---
-# Auto-detected below, but force with: UEFI=true or UEFI=false
-UEFI=""
-
 # --- Mirrors ---
 GENTOO_MIRROR="https://distfiles.gentoo.org"
 # ==============================================================================
 
 # ============================= AUTO-DETECTION =================================
-[[ -z "$UEFI" ]] && [[ -d /sys/firmware/efi ]] && UEFI=true || UEFI=false
-
-if [[ "$UEFI" == "true" ]]; then
+# Determine if we're booted in UEFI mode
+if [[ -d /sys/firmware/efi ]]; then
+    UEFI=true
     PARTITION_TYPE="gpt"
-    BOOT_PARTITION="${DISK}p1"   # EFI system partition
-    ROOT_PARTITION="${DISK}p2"   # Root partition
 else
+    UEFI=false
     PARTITION_TYPE="msdos"
-    BOOT_PARTITION="${DISK}p1"   # /boot (or / for BIOS)
-    ROOT_PARTITION="${DISK}p2"
 fi
 
-# Stage3 selection based on init system and desktop
+# Determine partition suffix: NVMe uses "p" (nvme0n1p1), sdX uses "" (sda1)
+if [[ "$DISK" =~ nvme ]]; then
+    PART_SUFFIX="p"
+else
+    PART_SUFFIX=""
+fi
+
+# Partition paths
+BOOT_PARTITION="${DISK}${PART_SUFFIX}1"
+ROOT_PARTITION="${DISK}${PART_SUFFIX}2"
+
+# Stage3 selection based on init system
 if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     STAGE3_BASE="stage3-amd64-desktop-systemd"
 else
     STAGE3_BASE="stage3-amd64-desktop-openrc"
 fi
-
-# EFI partition label (FAT32 filesystem label)
-EFI_LABEL="EFI"
 # ==============================================================================
 
 # ============================= HELPER FUNCTIONS ===============================
 info()  { echo -e "\033[1;34m[*]\033[0m $*"; }
-ok()    { echo -e "\033[1;32m[+]\033[0m $*"; }
+ok()    { echo -e "\033[1;32m[+\033[0m $*"; }
 err()   { echo -e "\033[1;31m[-]\033[0m $*" >&2; }
 die()   { err "$*"; exit 1; }
 
@@ -78,11 +76,6 @@ check_internet() {
     ping -c 1 -W 3 8.8.8.8 &>/dev/null || \
         die "No internet connection. Please connect to the internet first."
 }
-
-get_disk_suffix() {
-    # Returns p1/p2 for NVMe, 1/2 for sdX
-    [[ "$DISK" =~ nvme ]] && echo "p" || echo ""
-}
 # ==============================================================================
 
 # ============================= PHASE 1 — LiveISO ==============================
@@ -90,15 +83,14 @@ phase1() {
     check_root
     check_internet
 
-    local suffix
-    suffix=$(get_disk_suffix)
-    BOOT_PARTITION="${DISK}${suffix}1"
-    ROOT_PARTITION="${DISK}${suffix}2"
-
+    info "=============================="
+    info "  Gentoo Installer — Phase 1"
+    info "=============================="
+    echo ""
     info "Target disk:     $DISK"
     info "Boot partition:  $BOOT_PARTITION"
     info "Root partition:  $ROOT_PARTITION"
-    info "Partition table: $PARTITION_TYPE"
+    info "Partition table: $PARTITION_TYPE ($([ "$UEFI" == "true" ] && echo "UEFI" || echo "BIOS"))"
     info "Init system:     $INIT_SYSTEM"
     info "Desktop:         $DESKTOP"
     info "Hostname:        $HOSTNAME"
@@ -110,13 +102,20 @@ phase1() {
 
     # ----- Partitioning -----
     info "Partitioning $DISK with $PARTITION_TYPE layout..."
+    
+    # Wipe existing partition table
+    wipefs -a "$DISK"
+    sleep 1
+
     if [[ "$UEFI" == "true" ]]; then
+        # GPT + EFI System Partition + root
         parted --script "$DISK" \
             mklabel gpt \
             mkpart primary fat32 1MiB 512MiB \
             set 1 esp on \
-            mkpart primary 512MiB 100%
+            mkpart primary ext4 512MiB 100%
     else
+        # MBR + single partition for /, or /boot
         parted --script "$DISK" \
             mklabel msdos \
             mkpart primary ext4 1MiB 100% \
@@ -124,7 +123,13 @@ phase1() {
     fi
     sync
     sleep 2
+
+    # Let the kernel rescan the partition table
+    partprobe "$DISK" 2>/dev/null || udevadm settle || true
+    sleep 2
+
     ok "Partitioning done."
+    lsblk "$DISK"
 
     # ----- Formatting -----
     if [[ "$UEFI" == "true" ]]; then
@@ -140,12 +145,17 @@ phase1() {
     ok "Formatting done."
 
     # ----- Mounting -----
-    info "Mounting partitions..."
+    info "Mounting partitions to /mnt/gentoo..."
+    mkdir -p /mnt/gentoo
     mount "$ROOT_PARTITION" /mnt/gentoo
+
     if [[ "$UEFI" == "true" ]]; then
-        mount --mkdir "$BOOT_PARTITION" /mnt/gentoo/boot
+        mkdir -p /mnt/gentoo/boot
+        mount "$BOOT_PARTITION" /mnt/gentoo/boot
     fi
+
     ok "Partitions mounted."
+    lsblk "$DISK"
 
     # ----- Download and extract stage3 -----
     info "Fetching latest $STAGE3_BASE tarball URL..."
@@ -154,8 +164,11 @@ phase1() {
         "${GENTOO_MIRROR}/releases/amd64/autobuilds/latest-${STAGE3_BASE}.txt" \
         | grep -v '^#' | grep '\.tar\.xz$' | cut -d' ' -f1)
 
-    stage3_url="${GENTOO_MIRROR}/releases/amd64/autobuilds/${stage3_path}"
+    if [[ -z "$stage3_path" ]]; then
+        die "Failed to get stage3 path. Check GENTOO_MIRROR or internet connection."
+    fi
 
+    stage3_url="${GENTOO_MIRROR}/releases/amd64/autobuilds/${stage3_path}"
     info "Downloading stage3: $stage3_url"
     wget -q --show-progress -O /mnt/gentoo/stage3.tar.xz "$stage3_url"
 
@@ -171,7 +184,7 @@ phase1() {
     cp "$0" /mnt/gentoo/root/gentoo-installer.sh
     chmod +x /mnt/gentoo/root/gentoo-installer.sh
 
-    # ----- Mount necessary filesystems -----
+    # ----- Mount necessary filesystems for chroot -----
     info "Mounting pseudo-filesystems..."
     mount --types proc /proc /mnt/gentoo/proc
     mount --rbind /sys /mnt/gentoo/sys
@@ -184,7 +197,13 @@ phase1() {
     # ----- Copy DNS info -----
     cp -L /etc/resolv.conf /mnt/gentoo/etc/
 
-    ok "Phase 1 complete. Entering chroot..."
+    ok "Phase 1 complete. Entering chroot environment..."
+    echo ""
+    echo "  Run the following command inside the chroot to start Phase 2:"
+    echo "    ./gentoo-installer.sh phase2"
+    echo ""
+
+    # Enter chroot
     chroot /mnt/gentoo /bin/bash -c "
         source /etc/profile
         export PS1='(chroot) \w \$ '
@@ -196,15 +215,15 @@ phase1() {
         export USER_PASSWORD='$USER_PASSWORD'
         export UEFI='$UEFI'
         export BOOT_PARTITION='$BOOT_PARTITION'
+        export ROOT_PARTITION='$ROOT_PARTITION'
         export DISK='$DISK'
+        export PART_SUFFIX='$PART_SUFFIX'
         cd /root
-        echo 'Run the following to start Phase 2:'
-        echo '  ./gentoo-installer.sh phase2'
         exec /bin/bash --login
     "
 
     # ----- Cleanup after chroot exit -----
-    info "Unmounting and rebooting..."
+    info "Cleaning up mounts..."
     umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
     umount -R /mnt/gentoo 2>/dev/null || true
     ok "All partitions unmounted. You may now reboot."
@@ -215,7 +234,10 @@ phase1() {
 phase2() {
     check_root
 
-    info "Configuring Gentoo system with $DESKTOP desktop ($INIT_SYSTEM)..."
+    info "=============================="
+    info "  Gentoo Installer — Phase 2"
+    info "=============================="
+    echo ""
 
     # ----- Set timezone -----
     info "Setting timezone to UTC..."
@@ -234,22 +256,32 @@ phase2() {
 
     # ----- /etc/fstab generation -----
     info "Generating /etc/fstab..."
+    # Get UUIDs from the actual partitions
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PARTITION" 2>/dev/null || \
+                blkid -s UUID -o value "${DISK}${PART_SUFFIX}2")
+    
     cat > /etc/fstab <<FSTAB
 # /etc/fstab: static file system information
-# <fs>                  <mountpoint>    <type>  <opts>      <dump/pass>
-$(blkid -s UUID -o value "$ROOT_PARTITION") /               ext4    noatime,discard 0 1
+# <fs>                  <mountpoint>    <type>  <opts>              <dump/pass>
+UUID=${ROOT_UUID} /               ext4    noatime,discard     0 1
 FSTAB
+
     if [[ "$UEFI" == "true" ]]; then
+        BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PARTITION" 2>/dev/null || \
+                    blkid -s UUID -o value "${DISK}${PART_SUFFIX}1")
         cat >> /etc/fstab <<FSTAB
-$(blkid -s UUID -o value "$BOOT_PARTITION") /boot           vfat    noatime,defaults 0 2
+UUID=${BOOT_UUID} /boot           vfat    noatime,defaults    0 2
 FSTAB
     fi
+
+    echo "--- /etc/fstab ---"
+    cat /etc/fstab
     ok "fstab generated."
 
     # ----- Portage configuration -----
     info "Configuring Portage..."
     mkdir -p /etc/portage/repos.conf
-    cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf
+    cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf 2>/dev/null || true
 
     # Parallel builds and optimized MAKEOPTS
     local ncores
@@ -271,7 +303,7 @@ priority = 9999
 sync-uri = https://distfiles.gentoo.org/releases/amd64/binpackages/23.0/x86-64/
 BINHOST
 
-    # Accept licenses and keywords for desktop
+    # Accept licenses 
     mkdir -p /etc/portage/package.license
     cat > /etc/portage/package.license/accept <<LIC
 # Accept all licenses for desktop use (firmware, codecs, etc.)
@@ -289,15 +321,11 @@ KEY
 
     # ----- Select profile -----
     info "Selecting profile..."
-    # Map desktop names to Gentoo profile suffixes
     local profile_suffix
     case "$DESKTOP" in
         plasma) profile_suffix="desktop/plasma" ;;
         gnome)  profile_suffix="desktop/gnome" ;;
-        xfce)   profile_suffix="desktop" ;;  # xfce under generic desktop
-        lxqt)   profile_suffix="desktop" ;;
-        budgie) profile_suffix="desktop" ;;
-        sway)   profile_suffix="desktop" ;;  # Wayland/compositor
+        xfce|lxqt|budgie|sway) profile_suffix="desktop" ;;
         *)      profile_suffix="desktop" ;;
     esac
 
@@ -305,20 +333,11 @@ KEY
         profile_suffix="${profile_suffix}/systemd"
     fi
 
-    # For XFCE, LXQt, Budgie, Sway — no specific subprofile, use desktop/systemd or desktop
-    if [[ "$DESKTOP" =~ ^(xfce|lxqt|budgie|sway)$ ]]; then
-        if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-            profile_suffix="desktop/systemd"
-        else
-            profile_suffix="desktop"
-        fi
-    fi
-
     eselect profile set "default/linux/amd64/17.1/${profile_suffix}"
     ok "Profile set to: $(eselect profile show)"
 
     # ----- Update @world with new profile -----
-    info "Updating @world (this will compile the base desktop toolchain)..."
+    info "Updating @world (this will compile the base toolchain and desktop deps)..."
     emerge --update --deep --newuse @world 2>&1 | tail -10
 
     # ----- Install kernel -----
@@ -326,10 +345,9 @@ KEY
     emerge sys-kernel/gentoo-sources
     emerge sys-kernel/genkernel
 
-    info "Configuring and building kernel with genkernel..."
+    info "Building kernel with genkernel..."
     cd /usr/src/linux || die "Kernel sources not found!"
-    genkernel all --kernel-config=/proc/config.gz 2>&1 | tail -10 || \
-        genkernel all 2>&1 | tail -10
+    genkernel all 2>&1 | tail -10
     ok "Kernel built."
 
     # ----- Install firmware -----
@@ -342,9 +360,8 @@ KEY
            net-wireless/wpa_supplicant sys-apps/mlocate app-editors/vim \
            app-portage/eix app-portage/gentoolkit
 
-    # Init system specific
+    # Init system specific setup
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        emerge sys-fs/e2fsprogs sys-fs/dosfstools
         rc-update add sysklogd default
         rc-update add cronie default
         rc-update add dhcpcd default
@@ -357,7 +374,7 @@ KEY
     fi
 
     # ----- Install bootloader -----
-    info "Installing bootloader..."
+    info "Installing bootloader (GRUB)..."
     if [[ "$UEFI" == "true" ]]; then
         emerge sys-boot/grub sys-boot/efibootmgr
         grub-install --target=x86_64-efi --efi-directory=/boot
@@ -367,13 +384,6 @@ KEY
     fi
     grub-mkconfig -o /boot/grub/grub.cfg
     ok "Bootloader installed."
-
-    # ----- Configure networking (hostname) -----
-    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        cat > /etc/conf.d/hostname <<HOST
-hostname="$HOSTNAME"
-HOST
-    fi
 
     # ----- Set root password -----
     info "Setting root password..."
@@ -393,14 +403,12 @@ HOST
     case "$DESKTOP" in
         plasma)
             info "Installing KDE Plasma..."
-            emerge --autounmask-continue @plasma 2>&1 | tail -10 || \
-                emerge --autounmask-continue plasma-meta 2>&1 | tail -10
-            # Install a few extra apps
+            emerge --autounmask-continue plasma-meta 2>&1 | tail -10
             emerge kde-apps/kate kde-apps/dolphin kde-apps/konsole \
-                   kde-apps/gwenview kde-apps/okular www-client/firefox
+                   kde-apps/gwenview www-client/firefox
             if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-                rc-update add sddm default
                 emerge x11-misc/sddm
+                rc-update add sddm default
             else
                 systemctl enable sddm
             fi
@@ -421,29 +429,7 @@ HOST
             emerge --autounmask-continue xfce-base/xfce4-meta 2>&1 | tail -10
             emerge x11-terms/xfce4-terminal www-client/firefox \
                    xfce-extra/xfce4-notifyd
-            # LightDM as display manager
             emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter
-            if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-                rc-update add lightdm default
-            else
-                systemctl enable lightdm
-            fi
-            ;;
-        lxqt)
-            info "Installing LXQt..."
-            emerge --autounmask-continue lxqt-base/lxqt-meta 2>&1 | tail -10
-            emerge x11-misc/sddm www-client/firefox
-            if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-                rc-update add sddm default
-            else
-                systemctl enable sddm
-            fi
-            ;;
-        budgie)
-            info "Installing Budgie..."
-            emerge --autounmask-continue budgie-desktop 2>&1 | tail -10
-            emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter \
-                   www-client/firefox
             if [[ "$INIT_SYSTEM" == "openrc" ]]; then
                 rc-update add lightdm default
             else
@@ -455,36 +441,26 @@ HOST
             emerge --autounmask-continue gui-wm/sway 2>&1 | tail -10
             emerge gui-apps/waybar gui-apps/dunst gui-apps/wofi \
                    gui-apps/alacritty www-client/firefox
-            # Sway doesn't need a DM — can start from ~/.bash_profile
             mkdir -p /home/$USERNAME/.config/sway
-            cp /etc/sway/config /home/$USERNAME/.config/sway/config
+            cp /etc/sway/config /home/$USERNAME/.config/sway/config 2>/dev/null || true
             chown -R $USERNAME:$USERNAME /home/$USERNAME/.config
-            # Create a login manager override to start sway automatically
-            if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-                # systemd with `systemctl --user enable sway`
-                :
-            fi
             ;;
     esac
 
     # ----- Install audio (PipeWire) -----
     info "Installing PipeWire audio..."
-    emerge --autounmask-continue media-video/pipewire media-sound/pulseaudio \
-           media-sound/wireplumber
+    emerge --autounmask-continue media-video/pipewire media-sound/wireplumber
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
         rc-update add pipewire default 2>/dev/null || true
         rc-update add wireplumber default 2>/dev/null || true
     else
-        systemctl --global enable pipewire pipewire-pulse wireplumber 2>/dev/null || true
+        systemctl --global enable pipewire wireplumber 2>/dev/null || true
     fi
 
-    # ----- Install fonts and theming -----
-    info "Installing fonts and themes..."
-    emerge media-fonts/noto media-fonts/noto-cjk media-fonts/dejavu \
-           media-fonts/font-awesome media-fonts/liberation-fonts
-
-    # ----- Update environment -----
-    env-update && source /etc/profile
+    # ----- Install fonts -----
+    info "Installing fonts..."
+    emerge media-fonts/noto media-fonts/dejavu media-fonts/font-awesome \
+           media-fonts/liberation-fonts
 
     # ----- Final @world update -----
     info "Final @world update..."
@@ -492,7 +468,7 @@ HOST
 
     # ----- Cleanup -----
     info "Cleaning up..."
-    emerge --depclean
+    emerge --depclean 2>&1 | tail -5
     revdep-rebuild --quiet 2>/dev/null || true
 
     ok "================================================"
@@ -513,12 +489,14 @@ case "${1:-}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     *)
+        echo "Gentoo Installer — Automated Full Desktop Setup"
+        echo ""
         echo "Usage: $0 {phase1|phase2}"
         echo ""
-        echo "  phase1  — Run from LiveISO: partitions, downloads stage3, chroots"
-        echo "  phase2  — Run inside chroot after phase1: configures & installs desktop"
+        echo "  phase1  — Run from LiveISO"
+        echo "  phase2  — Run inside chroot after phase1"
         echo ""
-        echo "Edit the configuration variables at the top of this script before running."
+        echo "Edit the configuration variables at the top of this script first."
         exit 1
         ;;
 esac
