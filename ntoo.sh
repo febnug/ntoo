@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Eeu  # intentionally NOT pipefail — tar warnings can trigger it
+# set -Eeuo pipefail  # uncomment at your own risk if you want strict mode
 
 TARGET=/mnt/gentoo
 DISTBASE="https://distfiles.gentoo.org/releases/amd64/autobuilds"
@@ -93,7 +94,7 @@ LANJUT? Disk akan dihapus total.
 }
 
 disk_parts() {
-  if [[ "$DISK" =~ nvme|mmcblk ]]; then
+  if [[ "$DISK" =~ nvme|mmcblk|nvme[0-9]+n[0-9]+ ]]; then
     EFI="${DISK}p1"
     ROOT="${DISK}p2"
   else
@@ -131,17 +132,17 @@ mount_target() {
   mkdir -p "$TARGET/boot"
   mount "$EFI" "$TARGET/boot"
 
+  # Kernel filesystem mounts — the chroot script won't have access to the host's
+  # so we bind-mount them properly
   mkdir -p "$TARGET"/{proc,sys,dev,run}
 
-  mountpoint -q "$TARGET/proc" || mount -t proc /proc "$TARGET/proc"
-
-  mountpoint -q "$TARGET/sys" || mount --rbind /sys "$TARGET/sys"
+  mount -t proc /proc "$TARGET/proc"
+  mount --rbind /sys "$TARGET/sys"
   mount --make-rslave "$TARGET/sys" || true
-
-  mountpoint -q "$TARGET/dev" || mount --rbind /dev "$TARGET/dev"
+  mount --rbind /dev "$TARGET/dev"
   mount --make-rslave "$TARGET/dev" || true
-
-  mountpoint -q "$TARGET/run" || mount --bind /run "$TARGET/run"
+  mount --bind /run "$TARGET/run"
+  mount --make-rslave "$TARGET/run" || true
 }
 
 download_stage3() {
@@ -152,23 +153,38 @@ download_stage3() {
 
   cd "$TARGET"
 
-  wget -O latest-stage3.txt "$latest_url"
+  # FIX: The .txt file is PGP-signed with the format:
+  #   stage3-amd64-${INIT}-YYYYMMDDTHHMMSSZ.tar.xz  <size>
+  # We just grab the first non-blank, non-comment line with a .tar.xz filename
+  wget -q -O latest-stage3.txt "$latest_url"
 
-  STAGE3_FILE=$(awk '/stage3-amd64.*\.tar\.xz/ && !/CONTENTS|DIGESTS|asc|sha/ {print $1; exit}' latest-stage3.txt)
+  # Parse the actual tarball filename from the text file
+  # Lines look like:  stage3-amd64-openrc-20260705T170105Z.tar.xz 493607544
+  STAGE3_FILE=$(grep -oP 'stage3-amd64-\w+-\d{8}T\d{6}Z\.tar\.xz' latest-stage3.txt | head -n1)
 
   if [[ -z "${STAGE3_FILE:-}" ]]; then
-    STAGE3_FILE=$(grep -o "stage3-amd64-${INIT}-[0-9T]*Z.tar.xz" latest-stage3.txt | head -n1)
+    # Fallback: try any .tar.xz line
+    STAGE3_FILE=$(grep -oP 'stage3-amd64-\w+-[0-9TZ]+\.tar\.xz' latest-stage3.txt | head -n1)
   fi
 
   [[ -n "${STAGE3_FILE:-}" ]] || {
-    msg "Error" "Gagal parse stage3 filename."
+    msg "Error" "Gagal parse nama file stage3 dari latest-stage3.txt"
     exit 1
   }
 
+  msg "Stage3" "Downloading $STAGE3_FILE..."
   wget -O "$STAGE3_FILE" "$DISTBASE/$dir/$STAGE3_FILE"
 
   msg "Stage3" "Extracting $STAGE3_FILE..."
-  tar xpvf "$STAGE3_FILE" --xattrs-include='*.*' --numeric-owner >> "$LOG" 2>&1
+  # FIX: Use tar with pipefail-safe approach — ignore minor warnings
+  tar xpf "$STAGE3_FILE" --xattrs-include='*.*' --numeric-owner >> "$LOG" 2>&1 || {
+    local rc=$?
+    if [[ $rc -ge 2 ]]; then
+      msg "Error" "tar gagal dengan exit code $rc, cek $LOG"
+      exit 1
+    fi
+    # exit code 1 means minor warnings, continue
+  }
 }
 
 write_fstab() {
@@ -232,169 +248,153 @@ copy_resolv() {
 }
 
 write_chroot_script() {
-  cat > "$TARGET/root/install-chroot.sh" <<EOF
+  # FIX: Escape variables properly — we use 'EOF' for literal heredocs
+  # and normal EOF for template expansion
+  cat > "$TARGET/root/install-chroot.sh" <<'CHROOT_SCRIPT'
 #!/usr/bin/env bash
-set -Eeo pipefail
+set -Eeuo pipefail
 
-export DEBUGINFOD_URLS="\${DEBUGINFOD_URLS:-}"
+# Exported from the outer script
+: "${INIT:=openrc}"
+: "${HOSTNAME:=gentoo}"
+: "${USERNAME:=febri}"
+: "${TIMEZONE:=Asia/Jakarta}"
+: "${LOCALE:=en_US.UTF-8 UTF-8}"
+: "${ROOTPASS:=}"
+: "${USERPASS:=}"
+
+export DEBUGINFOD_URLS=""
 export PORTAGE_TMPDIR=/var/tmp
 export FEATURES="-test"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-emerge_retry() {
-  local pkg="\$1"
-
-  echo "[*] Emerging \$pkg"
-
-  if emerge --noreplace "\$pkg"; then
-    return 0
-  fi
-
-  echo "[!] emerge failed for \$pkg"
-  echo "[*] Trying autounmask for \$pkg"
-
-  emerge --noreplace --autounmask-write=y --autounmask-use=y "\$pkg" || true
-
-  etc-update --automode -5 || true
-  env-update
-  source /etc/profile
-
-  echo "[*] Retrying \$pkg"
-  emerge --noreplace "\$pkg"
-}
-
-install_kernel_safe() {
-  echo "[*] Installing kernel safely"
-
-  mkdir -p /etc/portage/package.use
-  mkdir -p /var/tmp/portage
-  mkdir -p /var/cache/distfiles
-
-  cat > /etc/portage/package.use/kernel <<'PUSE'
-sys-kernel/installkernel dracut
-sys-kernel/gentoo-kernel-bin initramfs
-sys-kernel/gentoo-kernel initramfs
-sys-kernel/gentoo-sources initramfs
-PUSE
-
-  emerge_retry sys-kernel/installkernel
-
-  echo "[*] Trying gentoo-kernel-bin first"
-
-  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
-    echo "[+] gentoo-kernel-bin installed"
-    return 0
-  fi
-
-  echo "[!] gentoo-kernel-bin failed"
-  echo "[*] Cleaning possible broken temp/cache files"
-
-  rm -rf /var/tmp/portage/sys-kernel/gentoo-kernel-bin-* || true
-  rm -f /var/cache/distfiles/*gentoo-kernel-bin* || true
-  rm -f /var/cache/distfiles/*kernel*x86* || true
-  rm -f /var/cache/distfiles/*linux*bin* || true
-
-  echo "[*] Retrying gentoo-kernel-bin after cleanup"
-
-  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
-    echo "[+] gentoo-kernel-bin installed after cleanup"
-    return 0
-  fi
-
-  echo "[!] gentoo-kernel-bin still failed"
-  echo "[*] Fallback to source-built sys-kernel/gentoo-kernel"
-
-  emerge_retry sys-kernel/gentoo-kernel
-
-  echo "[+] source-built gentoo-kernel installed"
-}
-
-install_grub_safe() {
-  echo "[*] Installing GRUB"
-
-  mkdir -p /boot/EFI
-
-  if [[ -d /sys/firmware/efi/efivars ]]; then
-    echo "[*] UEFI runtime detected"
-    echo "[*] Installing normal EFI boot entry"
-
-    grub-install \
-      --target=x86_64-efi \
-      --efi-directory=/boot \
-      --bootloader-id=Gentoo
+# Set up basic profile if needed
+if [[ -z "$(eselect profile show 2>/dev/null || true)" ]]; then
+  if [[ "$INIT" == "systemd" ]]; then
+    profile=$(eselect profile list | grep -oP '\[\d+\].*23\.0.*systemd' | head -1 | grep -oP '\d+(?=])' | head -1)
+    eselect profile set "$profile" 2>/dev/null || eselect profile set default/linux/amd64/23.0/systemd 2>/dev/null || true
   else
-    echo "[!] EFI runtime not available"
-    echo "[*] Installing removable fallback EFI bootloader"
-
-    grub-install \
-      --target=x86_64-efi \
-      --efi-directory=/boot \
-      --bootloader-id=Gentoo \
-      --removable \
-      --no-nvram
+    profile=$(eselect profile list | grep -oP '\[\d+\].*23\.0[^]]*' | grep -v systemd | head -1 | grep -oP '\d+(?=])' | head -1)
+    eselect profile set "$profile" 2>/dev/null || eselect profile set default/linux/amd64/23.0 2>/dev/null || true
   fi
-
-  grub-mkconfig -o /boot/grub/grub.cfg
-
-  echo "[*] GRUB files:"
-  find /boot -maxdepth 4 -type f | sort || true
-}
-
-echo "[*] Cleaning broken make.profile if needed"
-if [[ -e /etc/portage/make.profile && ! -L /etc/portage/make.profile ]]; then
-  rm -f /etc/portage/make.profile
 fi
 
-echo "[*] Preparing Portage dirs"
-mkdir -p /var/db/repos
+# Ensure essential dirs
 mkdir -p /etc/portage/package.use
 mkdir -p /etc/portage/package.accept_keywords
 mkdir -p /etc/portage/package.license
 mkdir -p /var/tmp/portage
+mkdir -p /var/cache/distfiles
+mkdir -p /var/db/repos
 
-echo "[*] Pre-seeding USE flags"
-cat > /etc/portage/package.use/installkernel <<'PUSE'
+# Preseed kernel USE flags
+cat > /etc/portage/package.use/kernel <<'PUSE'
 sys-kernel/installkernel dracut
 sys-kernel/gentoo-kernel-bin initramfs
 sys-kernel/gentoo-kernel initramfs
 sys-kernel/gentoo-sources initramfs
 PUSE
 
-echo "[*] Sync Portage"
-emerge-webrsync || emerge --sync
+# Sync
+echo "[*] Syncing Portage..."
+emerge-webrsync || emerge --sync || true
 
-echo "[*] Setting Gentoo profile"
-if [[ "$INIT" == "openrc" ]]; then
-  eselect profile set default/linux/amd64/23.0 || eselect profile set default/linux/amd64/17.1
-else
-  eselect profile set default/linux/amd64/23.0/systemd || eselect profile set default/linux/amd64/17.1/systemd
-fi
-
-env-update
-source /etc/profile
-
-echo "[*] Setting timezone"
+# Timezone
+echo "[*] Setting timezone..."
 echo "$TIMEZONE" > /etc/timezone
-emerge --config sys-libs/timezone-data || true
+emerge --config sys-libs/timezone-data 2>/dev/null || true
 
-echo "[*] Locale"
-grep -qxF "$LOCALE" /etc/locale.gen || echo "$LOCALE" >> /etc/locale.gen
-locale-gen
-eselect locale set en_US.utf8 || true
+# Locale
+echo "[*] Setting locale..."
+grep -qxF "$LOCALE" /etc/locale.gen 2>/dev/null || echo "$LOCALE" >> /etc/locale.gen
+locale-gen 2>/dev/null || true
+# Use first available UTF-8 locale
+eselect locale list | grep -i utf | head -1 | grep -oP '\[\d+\]' | tr -d '[]' | xargs -r eselect locale set 2>/dev/null || true
 env-update
 source /etc/profile
 
-echo "[*] Hostname"
+# Hostname
+echo "[*] Setting hostname..."
 echo "$HOSTNAME" > /etc/hostname
-
 cat > /etc/hosts <<HOSTS
 127.0.0.1 localhost
 127.0.1.1 $HOSTNAME
 ::1       localhost
 HOSTS
 
-echo "[*] Installing base packages"
+# emerge helper
+emerge_retry() {
+  local pkg="$1"
+  echo "[*] Emerging $pkg"
+
+  if emerge --noreplace "$pkg"; then
+    return 0
+  fi
+
+  echo "[!] emerge failed for $pkg, trying autounmask..."
+
+  # FIX: Correct flag — no =y
+  emerge --noreplace --autounmask-write --autounmask-use "$pkg" 2>/dev/null || true
+
+  # FIX: etc-update proper syntax: --automode 5 (no dash prefix)
+  if command -v etc-update &>/dev/null; then
+    echo "" | etc-update --automode 5 2>/dev/null || true
+  fi
+
+  env-update || true
+  source /etc/profile || true
+
+  echo "[*] Retrying $pkg..."
+  emerge --noreplace "$pkg"
+}
+
+# Firmware
+echo "[*] Installing firmware..."
 emerge_retry sys-kernel/linux-firmware
+
+# Kernel
+install_kernel_safe() {
+  echo "[*] Installing kernel (gentoo-kernel-bin preferred)..."
+
+  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
+    echo "[+] gentoo-kernel-bin installed"
+    return 0
+  fi
+
+  echo "[!] gentoo-kernel-bin failed, cleaning..."
+  rm -rf /var/tmp/portage/sys-kernel/gentoo-kernel-bin-* 2>/dev/null || true
+  rm -f /var/cache/distfiles/*gentoo-kernel-bin* 2>/dev/null || true
+
+  if emerge --noreplace sys-kernel/gentoo-kernel-bin; then
+    echo "[+] gentoo-kernel-bin installed after cleanup"
+    return 0
+  fi
+
+  echo "[!] Falling back to source-built sys-kernel/gentoo-kernel..."
+  emerge_retry sys-kernel/gentoo-kernel
+  echo "[+] gentoo-kernel installed"
+}
+
 install_kernel_safe
+
+# GRUB
+install_grub_safe() {
+  echo "[*] Installing GRUB..."
+  mkdir -p /boot/EFI
+
+  if mountpoint -q /sys/firmware/efi/efivars 2>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; then
+    echo "[*] UEFI runtime detected, installing normal EFI boot entry..."
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Gentoo
+  else
+    echo "[!] EFI runtime not fully available"
+    echo "[*] Installing removable fallback EFI bootloader..."
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Gentoo --removable --no-nvram
+  fi
+
+  grub-mkconfig -o /boot/grub/grub.cfg
+  echo "[*] GRUB files:"; find /boot -maxdepth 4 -type f 2>/dev/null | sort || true
+}
+
 emerge_retry sys-boot/grub
 emerge_retry net-misc/dhcpcd
 emerge_retry app-admin/sudo
@@ -402,50 +402,67 @@ emerge_retry app-shells/bash-completion
 emerge_retry sys-process/htop
 emerge_retry app-editors/vim
 
+# Networking
 if [[ "$INIT" == "openrc" ]]; then
-  emerge_retry net-misc/networkmanager || true
-
-  rc-update add dhcpcd default || true
-  rc-update add NetworkManager default || true
-else
-  emerge_retry net-misc/networkmanager || true
-
-  systemctl enable NetworkManager || true
-  systemctl enable systemd-networkd || true
-  systemctl enable systemd-resolved || true
+  emerge_retry net-misc/networkmanager 2>/dev/null || true
+  rc-update add dhcpcd default 2>/dev/null || true
+  rc-update add NetworkManager default 2>/dev/null || true
+elif [[ "$INIT" == "systemd" ]]; then
+  emerge_retry net-misc/networkmanager 2>/dev/null || true
+  systemctl enable NetworkManager 2>/dev/null || true
+  systemctl enable systemd-networkd 2>/dev/null || true
+  systemctl enable systemd-resolved 2>/dev/null || true
 fi
 
-echo "[*] Passwords"
+# Passwords
+echo "[*] Setting passwords..."
 echo "root:$ROOTPASS" | chpasswd
 
-if ! id "$USERNAME" >/dev/null 2>&1; then
+if ! id "$USERNAME" &>/dev/null; then
   useradd -m -G wheel,audio,video,usb,users -s /bin/bash "$USERNAME"
 fi
-
 echo "$USERNAME:$USERPASS" | chpasswd
 
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
-sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers || true
-
-echo "[*] Checking /boot"
-ls -lah /boot || true
+# sudo
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers 2>/dev/null || true
+sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers 2>/dev/null || true
 
 install_grub_safe
 
-echo "[*] Final env update"
 env-update
 source /etc/profile
 
-echo "[+] Done inside chroot"
-echo "[+] Gentoo install should be bootable now"
-EOF
+echo "[+] Done inside chroot — Gentoo install should be bootable now."
+CHROOT_SCRIPT
+
+  # Substitute runtime variables into the chroot script
+  sed -i \
+    -e "s|: \"\${INIT:=openrc}\"|: \"\${INIT:=$INIT}\"|" \
+    -e "s|: \"\${HOSTNAME:=gentoo}\"|: \"\${HOSTNAME:=$HOSTNAME}\"|" \
+    -e "s|: \"\${USERNAME:=febri}\"|: \"\${USERNAME:=$USERNAME}\"|" \
+    -e "s|: \"\${TIMEZONE:=Asia/Jakarta}\"|: \"\${TIMEZONE:=$TIMEZONE}\"|" \
+    -e "s|: \"\${LOCALE:=en_US.UTF-8 UTF-8}\"|: \"\${LOCALE:=$LOCALE}\"|" \
+    -e "s|: \"\${ROOTPASS:=}\"|: \"\${ROOTPASS:=$ROOTPASS}\"|" \
+    -e "s|: \"\${USERPASS:=}\"|: \"\${USERPASS:=$USERPASS}\"|" \
+    "$TARGET/root/install-chroot.sh"
 
   chmod +x "$TARGET/root/install-chroot.sh"
 }
 
 run_chroot() {
-  msg "Chroot" "Masuk chroot dan install kernel + GRUB. Ini bisa lama."
-  chroot "$TARGET" /bin/bash /root/install-chroot.sh 2>&1 | tee -a "$LOG"
+  msg "Chroot" "Masuk chroot dan install kernel + GRUB. Ini bisa memakan waktu lama."
+
+  # FIX: Set PATH inside chroot
+  chroot "$TARGET" /bin/env -i \
+    HOME=/root TERM="$TERM" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /bin/bash /root/install-chroot.sh 2>&1 | tee -a "$LOG"
+
+  local rc=${PIPESTATUS[0]}
+  if [[ $rc -ne 0 ]]; then
+    msg "Error" "Chroot script gagal dengan exit code $rc — cek $LOG"
+    exit 1
+  fi
 }
 
 cleanup() {
